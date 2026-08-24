@@ -413,6 +413,7 @@
       <div class="card-title">All fasts</div>
       <div id="history-list"></div>
     </div>
+    <button class="btn btn-ghost" id="btn-import">Import history</button>
   </section>
 
 </div>
@@ -429,6 +430,21 @@
     <div class="row-gap">
       <button class="btn btn-primary" id="edit-save">Save</button>
       <button class="btn btn-ghost" id="edit-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import history modal -->
+<div class="modal-bg" id="import-modal">
+  <div class="modal">
+    <h3>Import history</h3>
+    <p>Paste fast entries as JSON — each needs a date, duration in hours, and goal in hours. Existing history is kept; imported entries are added alongside it.</p>
+    <div class="field-lbl">JSON</div>
+    <textarea id="import-text" rows="8" style="width:100%; background:var(--bg-card-2); border:1px solid var(--line); color:var(--text); font-family:'DM Mono',monospace; font-size:12.5px; border-radius:10px; padding:10px 12px;" placeholder='[{"date":"2026-08-23","hours":16.3,"goalHours":16}, ...]'></textarea>
+    <div id="import-error" style="color:#D08A5A; font-size:12px; margin-top:8px; display:none;"></div>
+    <div class="row-gap">
+      <button class="btn btn-primary" id="import-save">Import</button>
+      <button class="btn btn-ghost" id="import-cancel">Cancel</button>
     </div>
   </div>
 </div>
@@ -556,6 +572,53 @@ document.getElementById('edit-save').addEventListener('click', ()=>{
     renderTimer();
   }
   editModal.classList.remove('show');
+});
+
+// ---------- import history ----------
+const importModal = document.getElementById('import-modal');
+document.getElementById('btn-import').addEventListener('click', ()=>{
+  document.getElementById('import-text').value = '';
+  document.getElementById('import-error').style.display = 'none';
+  importModal.classList.add('show');
+});
+document.getElementById('import-cancel').addEventListener('click', ()=>{
+  importModal.classList.remove('show');
+});
+document.getElementById('import-save').addEventListener('click', ()=>{
+  const errEl = document.getElementById('import-error');
+  errEl.style.display = 'none';
+  let entries;
+  try{
+    entries = JSON.parse(document.getElementById('import-text').value);
+    if(!Array.isArray(entries)) throw new Error('not an array');
+  }catch(e){
+    errEl.textContent = "Couldn't read that JSON — check the format and try again.";
+    errEl.style.display = 'block';
+    return;
+  }
+  let added = 0;
+  entries.forEach(item=>{
+    if(!item.date || typeof item.hours !== 'number') return;
+    const goalHours = typeof item.goalHours === 'number' ? item.goalHours : state.goalHours;
+    const durMs = Math.round(item.hours * 3600 * 1000);
+    // assume an 8:00 PM start the evening before the given date, ending on the given date
+    const endDate = new Date(`${item.date}T12:00:00`);
+    const start = new Date(endDate.getTime() - durMs);
+    const end = new Date(start.getTime() + durMs);
+    state.history.push({
+      start: start.toISOString(),
+      end: end.toISOString(),
+      goalHours,
+      durMs
+    });
+    added++;
+  });
+  state.history.sort((a,b)=> new Date(b.end) - new Date(a.end));
+  saveState();
+  importModal.classList.remove('show');
+  renderHistory();
+  renderStats();
+  renderTimer();
 });
 
 // ---------- render timer ----------
