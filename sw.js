@@ -1,4 +1,4 @@
-const CACHE = 'fasting-tracker-v2';
+const CACHE = 'fasting-tracker-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -24,6 +24,9 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
+  // Only manage caching for same-origin app-shell files. Google auth/Drive
+  // requests (accounts.google.com, googleapis.com) must always hit the network.
+  if (new URL(e.request.url).origin !== self.location.origin) return;
   e.respondWith(
     caches.match(e.request).then(cached => {
       const network = fetch(e.request).then(res => {
