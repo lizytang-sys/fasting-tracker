@@ -12,6 +12,7 @@
 <title>Fasting Tracker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root{
     --accent: #9B4D6A;
@@ -69,6 +70,30 @@
     font-family:'DM Mono', monospace;
     letter-spacing: 0.02em;
   }
+  #sync-btn{
+    border:none;
+    background: var(--bg-card);
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    font-family:'DM Sans', sans-serif;
+    font-size: 11.5px;
+    font-weight:600;
+    padding: 7px 12px;
+    border-radius: 20px;
+    display:flex;
+    align-items:center;
+    gap:6px;
+    white-space:nowrap;
+  }
+  #sync-btn .dot{
+    width:6px; height:6px; border-radius:50%;
+    background: var(--text-faint);
+    flex-shrink:0;
+  }
+  #sync-btn.synced .dot{ background: var(--success); }
+  #sync-btn.syncing .dot{ background: var(--gold); animation: pulse 1s infinite; }
+  #sync-btn.error .dot{ background: var(--warn); }
+  @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:0.3;} }
 
   /* tabs */
   nav.tabs{
@@ -325,6 +350,7 @@
       <div class="title">Fasting</div>
       <div class="subtitle" id="today-label">—</div>
     </div>
+    <button id="sync-btn"><span class="dot"></span><span id="sync-label">Connect Drive</span></button>
   </header>
 
   <nav class="tabs">
@@ -469,9 +495,179 @@ function loadState(){
   }catch(e){}
   return { goalHours: 16, active: null, history: [] };
 }
-function saveState(){ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+function saveState(){
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  scheduleCloudSync();
+}
 
 let state = loadState();
+
+// ================= Google Drive sync =================
+const GOOGLE_CLIENT_ID = '972329411344-t4n4fhq1eivgbvmhqem7nmitdjt16t5n.apps.googleusercontent.com';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+const DRIVE_FILE_NAME = 'fasting-tracker-data.json';
+let accessToken = null;
+let driveFileId = null;
+let tokenClient = null;
+let cloudSyncTimer = null;
+let syncing = false;
+
+function setSyncStatus(mode, label){
+  const btn = document.getElementById('sync-btn');
+  btn.className = mode;
+  document.getElementById('sync-label').textContent = label;
+}
+
+function loadTokenFromSession(){
+  const t = sessionStorage.getItem('gdrive_token');
+  const exp = sessionStorage.getItem('gdrive_token_exp');
+  if(t && exp && Date.now() < parseInt(exp,10)){
+    accessToken = t;
+    return true;
+  }
+  return false;
+}
+
+function initGoogle(){
+  if(typeof google === 'undefined' || !google.accounts){
+    // library not loaded yet, retry shortly
+    setTimeout(initGoogle, 400);
+    return;
+  }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: (resp) => {
+      if(resp.error){
+        setSyncStatus('error', 'Sign-in failed');
+        return;
+      }
+      accessToken = resp.access_token;
+      sessionStorage.setItem('gdrive_token', accessToken);
+      sessionStorage.setItem('gdrive_token_exp', String(Date.now() + (resp.expires_in-60)*1000));
+      pullThenPush();
+    }
+  });
+
+  if(loadTokenFromSession()){
+    pullThenPush();
+  }
+}
+
+document.getElementById('sync-btn').addEventListener('click', ()=>{
+  if(!tokenClient) return;
+  tokenClient.requestAccessToken({ prompt: accessToken ? '' : 'consent' });
+});
+
+async function driveFind(){
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D%27${DRIVE_FILE_NAME}%27&fields=files(id,modifiedTime)`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if(res.status === 401) throw { authExpired: true };
+  const data = await res.json();
+  return (data.files && data.files[0]) || null;
+}
+
+async function driveDownload(fileId){
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  if(res.status === 401) throw { authExpired: true };
+  return res.json();
+}
+
+async function driveCreate(content){
+  const boundary = 'ftboundary';
+  const metadata = { name: DRIVE_FILE_NAME, parents: ['appDataFolder'] };
+  const body =
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(content)}\r\n--${boundary}--`;
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+    body
+  });
+  if(res.status === 401) throw { authExpired: true };
+  const data = await res.json();
+  return data.id;
+}
+
+async function driveUpdate(fileId, content){
+  const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(content)
+  });
+  if(res.status === 401) throw { authExpired: true };
+}
+
+function mergeHistory(local, remote){
+  const key = f => `${f.start}|${f.end}`;
+  const map = new Map();
+  (remote||[]).forEach(f => map.set(key(f), f));
+  (local||[]).forEach(f => map.set(key(f), f)); // local wins on exact-key collision (rare)
+  return [...map.values()].sort((a,b) => new Date(b.end) - new Date(a.end));
+}
+
+async function pullThenPush(){
+  if(!accessToken || syncing) return;
+  syncing = true;
+  setSyncStatus('syncing', 'Syncing…');
+  try{
+    const file = await driveFind();
+    if(file){
+      driveFileId = file.id;
+      const remote = await driveDownload(file.id);
+      state.history = mergeHistory(state.history, remote.history);
+      // keep whichever active session is more recent, prefer an in-progress local one
+      if(!state.active && remote.active) state.active = remote.active;
+      if(typeof remote.goalHours === 'number' && !state.goalHours) state.goalHours = remote.goalHours;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      renderTimer(); renderStats(); renderHistory();
+      await driveUpdate(file.id, { ...state, updatedAt: Date.now() });
+    } else {
+      driveFileId = await driveCreate({ ...state, updatedAt: Date.now() });
+    }
+    setSyncStatus('synced', 'Synced');
+  }catch(e){
+    if(e && e.authExpired){
+      accessToken = null;
+      sessionStorage.removeItem('gdrive_token');
+      setSyncStatus('error', 'Reconnect Drive');
+    } else {
+      setSyncStatus('error', 'Sync failed');
+    }
+  }
+  syncing = false;
+}
+
+function scheduleCloudSync(){
+  if(!accessToken) return;
+  clearTimeout(cloudSyncTimer);
+  cloudSyncTimer = setTimeout(async ()=>{
+    setSyncStatus('syncing', 'Syncing…');
+    try{
+      if(driveFileId){
+        await driveUpdate(driveFileId, { ...state, updatedAt: Date.now() });
+      } else {
+        driveFileId = await driveCreate({ ...state, updatedAt: Date.now() });
+      }
+      setSyncStatus('synced', 'Synced');
+    }catch(e){
+      if(e && e.authExpired){
+        accessToken = null;
+        sessionStorage.removeItem('gdrive_token');
+        setSyncStatus('error', 'Reconnect Drive');
+      } else {
+        setSyncStatus('error', 'Sync failed');
+      }
+    }
+  }, 1500);
+}
+
+window.addEventListener('load', initGoogle);
+// =============== end Google Drive sync ===============
 
 // ---------- helpers ----------
 function pad(n){ return n.toString().padStart(2,'0'); }
@@ -771,3 +967,5 @@ if('serviceWorker' in navigator){
 </script>
 </body>
 </html>
+
+  
