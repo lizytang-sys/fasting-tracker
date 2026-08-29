@@ -312,6 +312,10 @@
     background:none; border:none; color: var(--text-faint);
     font-size:16px; padding: 4px 8px; margin-left:8px; cursor:pointer;
   }
+  .edit-pencil{
+    background:none; border:none; color: var(--text-faint);
+    font-size:14px; padding: 4px 6px; cursor:pointer;
+  }
 
   input[type=time], input[type=date]{
     background: var(--bg-card-2);
@@ -471,6 +475,27 @@
     <div class="row-gap">
       <button class="btn btn-primary" id="import-save">Import</button>
       <button class="btn btn-ghost" id="import-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit logged fast modal (start + end) -->
+<div class="modal-bg" id="edit-fast-modal">
+  <div class="modal">
+    <h3>Edit fast</h3>
+    <p>Adjust the exact start and end time for this logged fast.</p>
+    <div class="field-lbl">Start date</div>
+    <input type="date" id="ef-start-date">
+    <div class="field-lbl">Start time</div>
+    <input type="time" id="ef-start-time">
+    <div class="field-lbl">End date</div>
+    <input type="date" id="ef-end-date">
+    <div class="field-lbl">End time</div>
+    <input type="time" id="ef-end-time">
+    <div id="edit-fast-error" style="color:#D08A5A; font-size:12px; margin-top:8px; display:none;"></div>
+    <div class="row-gap">
+      <button class="btn btn-primary" id="edit-fast-save">Save</button>
+      <button class="btn btn-ghost" id="edit-fast-cancel">Cancel</button>
     </div>
   </div>
 </div>
@@ -932,6 +957,7 @@ function renderHistory(){
             <div class="dur ${hit?'hit':'miss'}">${fmtHM(f.durMs)}</div>
             <div class="badge">${hit? '✓ '+f.goalHours+'h goal':'goal '+f.goalHours+'h'}</div>
           </div>
+          <button class="edit-pencil" data-idx="${idx}" aria-label="Edit">✎</button>
           <button class="del-x" data-idx="${idx}" aria-label="Delete">✕</button>
         </div>
       </div>
@@ -947,7 +973,63 @@ function renderHistory(){
       renderStats();
     });
   });
+
+  el.querySelectorAll('.edit-pencil').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      openEditFast(parseInt(btn.dataset.idx,10));
+    });
+  });
 }
+
+// ---------- edit logged fast (start + end) ----------
+const editFastModal = document.getElementById('edit-fast-modal');
+let editFastIdx = null;
+
+function openEditFast(idx){
+  editFastIdx = idx;
+  const f = state.history[idx];
+  const s = new Date(f.start);
+  const en = new Date(f.end);
+  document.getElementById('ef-start-date').value = s.toISOString().slice(0,10);
+  document.getElementById('ef-start-time').value = pad(s.getHours())+':'+pad(s.getMinutes());
+  document.getElementById('ef-end-date').value = en.toISOString().slice(0,10);
+  document.getElementById('ef-end-time').value = pad(en.getHours())+':'+pad(en.getMinutes());
+  document.getElementById('edit-fast-error').style.display = 'none';
+  editFastModal.classList.add('show');
+}
+
+document.getElementById('edit-fast-cancel').addEventListener('click', ()=>{
+  editFastModal.classList.remove('show');
+});
+
+document.getElementById('edit-fast-save').addEventListener('click', ()=>{
+  const errEl = document.getElementById('edit-fast-error');
+  const sd = document.getElementById('ef-start-date').value;
+  const st = document.getElementById('ef-start-time').value;
+  const ed = document.getElementById('ef-end-date').value;
+  const et = document.getElementById('ef-end-time').value;
+  if(!sd || !st || !ed || !et){
+    errEl.textContent = 'Please fill in all four fields.';
+    errEl.style.display = 'block';
+    return;
+  }
+  const newStart = new Date(`${sd}T${st}:00`);
+  const newEnd = new Date(`${ed}T${et}:00`);
+  if(newEnd <= newStart){
+    errEl.textContent = 'End time must be after start time.';
+    errEl.style.display = 'block';
+    return;
+  }
+  const f = state.history[editFastIdx];
+  f.start = newStart.toISOString();
+  f.end = newEnd.toISOString();
+  f.durMs = newEnd - newStart;
+  state.history.sort((a,b)=> new Date(b.end) - new Date(a.end));
+  saveState();
+  editFastModal.classList.remove('show');
+  renderHistory();
+  renderStats();
+});
 
 // ---------- quote ----------
 document.getElementById('quote').textContent = QUOTES[new Date().getDate() % QUOTES.length];
