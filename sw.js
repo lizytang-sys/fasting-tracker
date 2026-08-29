@@ -1,4 +1,4 @@
-const CACHE = 'fasting-tracker-v3';
+const CACHE = 'fasting-tracker-v4';
 const ASSETS = [
   './',
   './index.html',
@@ -22,21 +22,23 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// Network-first: always try to fetch the latest version. Only fall back to
+// the cached copy if the network request fails (i.e. actually offline).
+// This prevents the app from getting stuck on an old broken version after
+// an update is pushed, at the cost of needing a connection for the very
+// freshest load (cache still covers true offline use).
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
-  // Only manage caching for same-origin app-shell files. Google auth/Drive
-  // requests (accounts.google.com, googleapis.com) must always hit the network.
   if (new URL(e.request.url).origin !== self.location.origin) return;
   e.respondWith(
-    caches.match(e.request).then(cached => {
-      const network = fetch(e.request).then(res => {
+    fetch(e.request)
+      .then(res => {
         if (res && res.status === 200) {
           const clone = res.clone();
           caches.open(CACHE).then(cache => cache.put(e.request, clone));
         }
         return res;
-      }).catch(() => cached);
-      return cached || network;
-    })
+      })
+      .catch(() => caches.match(e.request))
   );
 });
