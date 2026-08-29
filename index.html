@@ -960,6 +960,15 @@ setInterval(renderTimer, 1000);
 
 // ---------- service worker ----------
 if('serviceWorker' in navigator){
+  let swRefreshed = false;
+  navigator.serviceWorker.addEventListener('controllerchange', ()=>{
+    // A newer service worker just took control (i.e. an update was pushed).
+    // Reload once so the page picks up the new version automatically instead
+    // of getting stuck showing an old cached copy.
+    if(swRefreshed) return;
+    swRefreshed = true;
+    window.location.reload();
+  });
   window.addEventListener('load', ()=>{
     navigator.serviceWorker.register('sw.js').catch(()=>{});
   });
@@ -967,5 +976,3 @@ if('serviceWorker' in navigator){
 </script>
 </body>
 </html>
-
-  
