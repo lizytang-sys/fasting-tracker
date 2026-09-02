@@ -1,4 +1,4 @@
-const CACHE = 'fasting-tracker-v5';
+const CACHE = 'fasting-tracker-v7';
 const ASSETS = [
   './',
   './index.html',
