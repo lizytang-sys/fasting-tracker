@@ -518,9 +518,10 @@ function loadState(){
     const raw = localStorage.getItem(STORAGE_KEY);
     if(raw) return JSON.parse(raw);
   }catch(e){}
-  return { goalHours: 16, active: null, history: [] };
+  return { goalHours: 16, active: null, history: [], updatedAt: 0 };
 }
 function saveState(){
+  state.updatedAt = Date.now();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   scheduleCloudSync();
 }
@@ -644,15 +645,37 @@ async function pullThenPush(){
     if(file){
       driveFileId = file.id;
       const remote = await driveDownload(file.id);
-      state.history = mergeHistory(state.history, remote.history);
-      // keep whichever active session is more recent, prefer an in-progress local one
-      if(!state.active && remote.active) state.active = remote.active;
-      if(typeof remote.goalHours === 'number' && !state.goalHours) state.goalHours = remote.goalHours;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      renderTimer(); renderStats(); renderHistory();
-      await driveUpdate(file.id, { ...state, updatedAt: Date.now() });
+      const remoteUpdatedAt = typeof remote.updatedAt === 'number' ? remote.updatedAt : 0;
+      const localUpdatedAt = typeof state.updatedAt === 'number' ? state.updatedAt : 0;
+
+      if(remoteUpdatedAt > localUpdatedAt){
+        // Drive has a more recent copy than this device — adopt it wholesale
+        // rather than merging, so a deletion made elsewhere actually sticks
+        // instead of the deleted item reappearing from a stale local copy.
+        state.history = remote.history || [];
+        state.active = remote.active || null;
+        if(typeof remote.goalHours === 'number') state.goalHours = remote.goalHours;
+        state.updatedAt = remoteUpdatedAt;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        renderTimer(); renderStats(); renderHistory();
+      } else if(localUpdatedAt > remoteUpdatedAt){
+        // This device is more recent — push it wholesale to overwrite Drive.
+        await driveUpdate(file.id, { ...state });
+      } else {
+        // Both at 0 / unknown (first-ever sync on either side) — safe to
+        // combine once so no pre-existing data is lost, then that combined
+        // result becomes the new authoritative "latest" on both sides.
+        state.history = mergeHistory(state.history, remote.history);
+        if(!state.active && remote.active) state.active = remote.active;
+        if(typeof remote.goalHours === 'number' && !state.goalHours) state.goalHours = remote.goalHours;
+        state.updatedAt = Date.now();
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        renderTimer(); renderStats(); renderHistory();
+        await driveUpdate(file.id, { ...state });
+      }
     } else {
-      driveFileId = await driveCreate({ ...state, updatedAt: Date.now() });
+      state.updatedAt = state.updatedAt || Date.now();
+      driveFileId = await driveCreate({ ...state });
     }
     setSyncStatus('synced', 'Synced');
   }catch(e){
@@ -674,9 +697,9 @@ function scheduleCloudSync(){
     setSyncStatus('syncing', 'Syncing…');
     try{
       if(driveFileId){
-        await driveUpdate(driveFileId, { ...state, updatedAt: Date.now() });
+        await driveUpdate(driveFileId, { ...state });
       } else {
-        driveFileId = await driveCreate({ ...state, updatedAt: Date.now() });
+        driveFileId = await driveCreate({ ...state });
       }
       setSyncStatus('synced', 'Synced');
     }catch(e){
@@ -696,6 +719,14 @@ window.addEventListener('load', initGoogle);
 
 // ---------- helpers ----------
 function pad(n){ return n.toString().padStart(2,'0'); }
+// Local calendar date as YYYY-MM-DD — deliberately NOT toISOString(), which
+// converts to UTC and can roll the date forward/back a day for evening
+// fasts (e.g. an 8 PM Pacific start becomes ~3 AM UTC the next calendar
+// day). Every place that needs "what day is this, on this phone" should
+// use this instead.
+function localDateStr(d){
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+}
 function fmtHMS(ms){
   const totalSec = Math.max(0, Math.floor(ms/1000));
   const h = Math.floor(totalSec/3600);
@@ -776,7 +807,7 @@ const editModal = document.getElementById('edit-modal');
 document.getElementById('btn-edit-start').addEventListener('click', ()=>{
   if(!state.active) return;
   const d = new Date(state.active.start);
-  document.getElementById('edit-date').value = d.toISOString().slice(0,10);
+  document.getElementById('edit-date').value = localDateStr(d);
   document.getElementById('edit-time').value = pad(d.getHours())+':'+pad(d.getMinutes());
   editModal.classList.add('show');
 });
@@ -846,6 +877,7 @@ document.getElementById('import-save').addEventListener('click', ()=>{
 const RING_CIRC = 2 * Math.PI * 112;
 
 function renderTimer(){
+  try{
   document.getElementById('today-label').textContent = todayLabel();
   const idle = document.getElementById('idle-controls');
   const activeC = document.getElementById('active-controls');
@@ -855,17 +887,18 @@ function renderTimer(){
     b.classList.toggle('sel', parseInt(b.dataset.goal,10)===state.goalHours);
   });
 
-  if(state.active){
+  if(state.active && state.active.start){
     idle.style.display = 'none';
     activeC.style.display = 'block';
     const start = new Date(state.active.start);
-    const goalMs = state.active.goalHours * 3600 * 1000;
+    const goalHours = typeof state.active.goalHours === 'number' ? state.active.goalHours : (state.goalHours || 16);
+    const goalMs = goalHours * 3600 * 1000;
     const elapsed = Date.now() - start.getTime();
-    const pct = Math.min(1, elapsed / goalMs);
+    const pct = Math.min(1, Math.max(0, elapsed / goalMs));
     document.getElementById('ring-progress').setAttribute('stroke-dasharray', `${pct*RING_CIRC} ${RING_CIRC}`);
     document.getElementById('timer-big').textContent = fmtHMS(elapsed);
     document.getElementById('timer-label').textContent = elapsed >= goalMs ? 'Goal reached — keep going or end' : 'Fasting';
-    document.getElementById('timer-goal').textContent = `Goal ${state.active.goalHours}h · started ${fmtClock(state.active.start)}`;
+    document.getElementById('timer-goal').textContent = `Goal ${goalHours}h · started ${fmtClock(state.active.start)}`;
   } else {
     idle.style.display = 'block';
     activeC.style.display = 'none';
@@ -874,6 +907,7 @@ function renderTimer(){
     document.getElementById('timer-label').textContent = 'Not fasting';
     document.getElementById('timer-goal').textContent = '';
   }
+  }catch(e){ /* never let a bad state value permanently wedge the display */ }
 }
 
 // ---------- stats ----------
@@ -881,7 +915,7 @@ function computeStreaks(){
   // a "hit" day = a fast in history whose duration met its goal, keyed by end-date
   const hits = state.history
     .filter(f => f.durMs >= f.goalHours*3600*1000)
-    .map(f => new Date(f.end).toISOString().slice(0,10));
+    .map(f => localDateStr(new Date(f.end)));
   const uniqueDays = [...new Set(hits)].sort().reverse(); // desc
   if(uniqueDays.length === 0) return { current:0, best:0 };
 
@@ -889,13 +923,13 @@ function computeStreaks(){
   let cursor = new Date();
   cursor.setHours(0,0,0,0);
   for(let i=0;i<uniqueDays.length;i++){
-    const dayStr = cursor.toISOString().slice(0,10);
+    const dayStr = localDateStr(cursor);
     if(uniqueDays.includes(dayStr)){
       current++;
       cursor.setDate(cursor.getDate()-1);
     } else {
       // allow the streak to still "count as current" if today just hasn't happened yet
-      if(i===0 && dayStr === new Date().toISOString().slice(0,10)) {
+      if(i===0 && dayStr === localDateStr(new Date())) {
         cursor.setDate(cursor.getDate()-1);
         continue;
       }
@@ -933,7 +967,7 @@ function renderStats(){
   const last30 = state.history.filter(f => new Date(f.end).getTime() >= cutoff);
   const avgMs = last30.length ? last30.reduce((a,f)=>a+f.durMs,0)/last30.length : 0;
   document.getElementById('avg-dur').textContent = last30.length ? fmtHM(avgMs) : '—';
-  const daysHit30 = new Set(last30.filter(f=>f.durMs>=f.goalHours*3600*1000).map(f=>new Date(f.end).toISOString().slice(0,10))).size;
+  const daysHit30 = new Set(last30.filter(f=>f.durMs>=f.goalHours*3600*1000).map(f=>localDateStr(new Date(f.end)))).size;
   document.getElementById('days-30').textContent = `${daysHit30} / 30`;
 }
 
@@ -990,9 +1024,9 @@ function openEditFast(idx){
   const f = state.history[idx];
   const s = new Date(f.start);
   const en = new Date(f.end);
-  document.getElementById('ef-start-date').value = s.toISOString().slice(0,10);
+  document.getElementById('ef-start-date').value = localDateStr(s);
   document.getElementById('ef-start-time').value = pad(s.getHours())+':'+pad(s.getMinutes());
-  document.getElementById('ef-end-date').value = en.toISOString().slice(0,10);
+  document.getElementById('ef-end-date').value = localDateStr(en);
   document.getElementById('ef-end-time').value = pad(en.getHours())+':'+pad(en.getMinutes());
   document.getElementById('edit-fast-error').style.display = 'none';
   editFastModal.classList.add('show');
@@ -1039,6 +1073,20 @@ renderTimer();
 renderStats();
 renderHistory();
 setInterval(renderTimer, 1000);
+
+// iOS suspends timers while the app is backgrounded/locked. When the app
+// comes back to the foreground, force an immediate correct re-render
+// (renderTimer recomputes elapsed from Date.now() fresh each call, so this
+// always self-corrects instantly) instead of waiting on a possibly-stalled
+// tick, and opportunistically re-sync with Drive too.
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden){
+    renderTimer();
+    renderStats();
+    renderHistory();
+    if(accessToken) pullThenPush();
+  }
+});
 
 // ---------- service worker ----------
 if('serviceWorker' in navigator){
