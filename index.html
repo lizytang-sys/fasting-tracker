@@ -516,9 +516,13 @@ const QUOTES = [
 function loadState(){
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
-    if(raw) return JSON.parse(raw);
+    if(raw){
+      const parsed = JSON.parse(raw);
+      if(!Array.isArray(parsed.deletedKeys)) parsed.deletedKeys = [];
+      return parsed;
+    }
   }catch(e){}
-  return { goalHours: 16, active: null, history: [], updatedAt: 0 };
+  return { goalHours: 16, active: null, history: [], deletedKeys: [], updatedAt: 0 };
 }
 function saveState(){
   state.updatedAt = Date.now();
@@ -628,12 +632,36 @@ async function driveUpdate(fileId, content){
   if(res.status === 401) throw { authExpired: true };
 }
 
-function mergeHistory(local, remote){
-  const key = f => `${f.start}|${f.end}`;
+function fastKey(f){ return `${f.start}|${f.end}`; }
+
+// A safe merge that can only ever ADD data, never silently drop it just
+// because one side's timestamp looks "newer" (a freshly reset device can
+// have a newer timestamp than a device with weeks of real history — that
+// was the exact bug that wiped history before). The only way an entry
+// disappears is if it's explicitly listed in deletedKeys by either side.
+function mergeState(local, remote){
+  const deletedKeys = new Set([...(local.deletedKeys||[]), ...(remote.deletedKeys||[])]);
+
   const map = new Map();
-  (remote||[]).forEach(f => map.set(key(f), f));
-  (local||[]).forEach(f => map.set(key(f), f)); // local wins on exact-key collision (rare)
-  return [...map.values()].sort((a,b) => new Date(b.end) - new Date(a.end));
+  (remote.history||[]).forEach(f => map.set(fastKey(f), f));
+  (local.history||[]).forEach(f => map.set(fastKey(f), f)); // local's version wins on exact collision
+  const mergedHistory = [...map.values()]
+    .filter(f => !deletedKeys.has(fastKey(f)))
+    .sort((a,b) => new Date(b.end) - new Date(a.end));
+
+  // Prefer whichever side has an in-progress fast; if both do, keep local
+  // (it's the one currently on screen).
+  const mergedActive = local.active || remote.active || null;
+  const mergedGoal = typeof local.goalHours === 'number' ? local.goalHours
+                    : (typeof remote.goalHours === 'number' ? remote.goalHours : 16);
+
+  return {
+    history: mergedHistory,
+    active: mergedActive,
+    goalHours: mergedGoal,
+    deletedKeys: [...deletedKeys],
+    updatedAt: Date.now()
+  };
 }
 
 async function pullThenPush(){
@@ -645,34 +673,15 @@ async function pullThenPush(){
     if(file){
       driveFileId = file.id;
       const remote = await driveDownload(file.id);
-      const remoteUpdatedAt = typeof remote.updatedAt === 'number' ? remote.updatedAt : 0;
-      const localUpdatedAt = typeof state.updatedAt === 'number' ? state.updatedAt : 0;
-
-      if(remoteUpdatedAt > localUpdatedAt){
-        // Drive has a more recent copy than this device — adopt it wholesale
-        // rather than merging, so a deletion made elsewhere actually sticks
-        // instead of the deleted item reappearing from a stale local copy.
-        state.history = remote.history || [];
-        state.active = remote.active || null;
-        if(typeof remote.goalHours === 'number') state.goalHours = remote.goalHours;
-        state.updatedAt = remoteUpdatedAt;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-        renderTimer(); renderStats(); renderHistory();
-      } else if(localUpdatedAt > remoteUpdatedAt){
-        // This device is more recent — push it wholesale to overwrite Drive.
-        await driveUpdate(file.id, { ...state });
-      } else {
-        // Both at 0 / unknown (first-ever sync on either side) — safe to
-        // combine once so no pre-existing data is lost, then that combined
-        // result becomes the new authoritative "latest" on both sides.
-        state.history = mergeHistory(state.history, remote.history);
-        if(!state.active && remote.active) state.active = remote.active;
-        if(typeof remote.goalHours === 'number' && !state.goalHours) state.goalHours = remote.goalHours;
-        state.updatedAt = Date.now();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-        renderTimer(); renderStats(); renderHistory();
-        await driveUpdate(file.id, { ...state });
-      }
+      const merged = mergeState(state, remote || {});
+      state.history = merged.history;
+      state.active = merged.active;
+      state.goalHours = merged.goalHours;
+      state.deletedKeys = merged.deletedKeys;
+      state.updatedAt = merged.updatedAt;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      renderTimer(); renderStats(); renderHistory();
+      await driveUpdate(file.id, { ...state });
     } else {
       state.updatedAt = state.updatedAt || Date.now();
       driveFileId = await driveCreate({ ...state });
@@ -694,23 +703,10 @@ function scheduleCloudSync(){
   if(!accessToken) return;
   clearTimeout(cloudSyncTimer);
   cloudSyncTimer = setTimeout(async ()=>{
-    setSyncStatus('syncing', 'Syncing…');
-    try{
-      if(driveFileId){
-        await driveUpdate(driveFileId, { ...state });
-      } else {
-        driveFileId = await driveCreate({ ...state });
-      }
-      setSyncStatus('synced', 'Synced');
-    }catch(e){
-      if(e && e.authExpired){
-        accessToken = null;
-        sessionStorage.removeItem('gdrive_token');
-        setSyncStatus('error', 'Reconnect Drive');
-      } else {
-        setSyncStatus('error', 'Sync failed');
-      }
-    }
+    // Always merge-with-remote before pushing, even on a routine save, so a
+    // quick local edit can never clobber history that arrived on the other
+    // device moments ago.
+    pullThenPush();
   }, 1500);
 }
 
@@ -850,10 +846,30 @@ document.getElementById('import-save').addEventListener('click', ()=>{
   }
   let added = 0;
   entries.forEach(item=>{
+    // Precise shape: exact local start/end datetimes (no timezone suffix,
+    // so the phone's own JS parses them in its own local time — this
+    // preserves exact logged times instead of collapsing to a generic
+    // 8PM-start/noon-end pattern).
+    if(item.startLocal && item.endLocal){
+      const start = new Date(item.startLocal);
+      const end = new Date(item.endLocal);
+      if(isNaN(start) || isNaN(end) || end <= start) return;
+      const goalHours = typeof item.goalHours === 'number' ? item.goalHours : state.goalHours;
+      state.history.push({
+        start: start.toISOString(),
+        end: end.toISOString(),
+        goalHours,
+        durMs: end - start
+      });
+      added++;
+      return;
+    }
+    // Legacy shorthand: a date + a duration in hours. Assumes the fast
+    // ended at noon on that date, with the start time backed out from the
+    // duration — good for rough historical backfills, not exact times.
     if(!item.date || typeof item.hours !== 'number') return;
     const goalHours = typeof item.goalHours === 'number' ? item.goalHours : state.goalHours;
     const durMs = Math.round(item.hours * 3600 * 1000);
-    // assume an 8:00 PM start the evening before the given date, ending on the given date
     const endDate = new Date(`${item.date}T12:00:00`);
     const start = new Date(endDate.getTime() - durMs);
     const end = new Date(start.getTime() + durMs);
@@ -1001,6 +1017,11 @@ function renderHistory(){
   el.querySelectorAll('.del-x').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const idx = parseInt(btn.dataset.idx,10);
+      const removed = state.history[idx];
+      if(removed){
+        if(!Array.isArray(state.deletedKeys)) state.deletedKeys = [];
+        state.deletedKeys.push(fastKey(removed));
+      }
       state.history.splice(idx,1);
       saveState();
       renderHistory();
