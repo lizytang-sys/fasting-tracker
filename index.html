@@ -519,10 +519,27 @@ function loadState(){
     if(raw){
       const parsed = JSON.parse(raw);
       if(!Array.isArray(parsed.deletedKeys)) parsed.deletedKeys = [];
+      if(Array.isArray(parsed.history)){
+        parsed.history = dedupeHistory(parsed.history);
+      }
       return parsed;
     }
   }catch(e){}
   return { goalHours: 16, active: null, history: [], deletedKeys: [], updatedAt: 0 };
+}
+// Collapse exact duplicate entries (same start AND end timestamp) down to
+// one — guards against a double-tapped Save/Import ever leaving two
+// identical copies of the same logged fast.
+function dedupeHistory(history){
+  const seen = new Set();
+  const out = [];
+  for(const f of history){
+    const k = `${f.start}|${f.end}`;
+    if(seen.has(k)) continue;
+    seen.add(k);
+    out.push(f);
+  }
+  return out;
 }
 function saveState(){
   state.updatedAt = Date.now();
@@ -844,7 +861,9 @@ document.getElementById('import-save').addEventListener('click', ()=>{
     errEl.style.display = 'block';
     return;
   }
+  const existingKeys = new Set(state.history.map(f => `${f.start}|${f.end}`));
   let added = 0;
+  let skippedDupes = 0;
   entries.forEach(item=>{
     // Precise shape: exact local start/end datetimes (no timezone suffix,
     // so the phone's own JS parses them in its own local time — this
@@ -854,6 +873,9 @@ document.getElementById('import-save').addEventListener('click', ()=>{
       const start = new Date(item.startLocal);
       const end = new Date(item.endLocal);
       if(isNaN(start) || isNaN(end) || end <= start) return;
+      const key = `${start.toISOString()}|${end.toISOString()}`;
+      if(existingKeys.has(key)){ skippedDupes++; return; } // already imported — don't duplicate
+      existingKeys.add(key);
       const goalHours = typeof item.goalHours === 'number' ? item.goalHours : state.goalHours;
       state.history.push({
         start: start.toISOString(),
@@ -873,6 +895,9 @@ document.getElementById('import-save').addEventListener('click', ()=>{
     const endDate = new Date(`${item.date}T12:00:00`);
     const start = new Date(endDate.getTime() - durMs);
     const end = new Date(start.getTime() + durMs);
+    const key = `${start.toISOString()}|${end.toISOString()}`;
+    if(existingKeys.has(key)){ skippedDupes++; return; }
+    existingKeys.add(key);
     state.history.push({
       start: start.toISOString(),
       end: end.toISOString(),
