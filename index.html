@@ -12,7 +12,6 @@
 <title>Fasting Tracker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root{
     --accent: #9B4D6A;
@@ -70,7 +69,7 @@
     font-family:'DM Mono', monospace;
     letter-spacing: 0.02em;
   }
-  #sync-btn{
+  #header-btn{
     border:none;
     background: var(--bg-card);
     border: 1px solid var(--line);
@@ -78,22 +77,11 @@
     font-family:'DM Sans', sans-serif;
     font-size: 11.5px;
     font-weight:600;
-    padding: 7px 12px;
+    padding: 7px 14px;
     border-radius: 20px;
-    display:flex;
-    align-items:center;
-    gap:6px;
     white-space:nowrap;
   }
-  #sync-btn .dot{
-    width:6px; height:6px; border-radius:50%;
-    background: var(--text-faint);
-    flex-shrink:0;
-  }
-  #sync-btn.synced .dot{ background: var(--success); }
-  #sync-btn.syncing .dot{ background: var(--gold); animation: pulse 1s infinite; }
-  #sync-btn.error .dot{ background: var(--warn); }
-  @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+  #header-btn:active{ opacity:0.7; }
 
   /* tabs */
   nav.tabs{
@@ -354,7 +342,7 @@
       <div class="title">Fasting</div>
       <div class="subtitle" id="today-label">—</div>
     </div>
-    <button id="sync-btn"><span class="dot"></span><span id="sync-label">Connect Drive</span></button>
+    <button id="header-btn">Export</button>
   </header>
 
   <nav class="tabs">
@@ -468,7 +456,9 @@
 <div class="modal-bg" id="import-modal">
   <div class="modal">
     <h3>Import history</h3>
-    <p>Paste fast entries as JSON — each needs a date, duration in hours, and goal in hours. Existing history is kept; imported entries are added alongside it.</p>
+    <p>Load a backup file, or paste fast entries as JSON — each needs a date, duration in hours, and goal in hours. Existing history is kept; imported entries are added alongside it.</p>
+    <input type="file" id="import-file" accept="application/json,.json" style="display:none;">
+    <button class="btn btn-ghost" id="import-file-btn" style="margin-bottom:12px;">Load from file…</button>
     <div class="field-lbl">JSON</div>
     <textarea id="import-text" rows="8" style="width:100%; background:var(--bg-card-2); border:1px solid var(--line); color:var(--text); font-family:'DM Mono',monospace; font-size:12.5px; border-radius:10px; padding:10px 12px;" placeholder='[{"date":"2026-08-23","hours":16.3,"goalHours":16}, ...]'></textarea>
     <div id="import-error" style="color:#D08A5A; font-size:12px; margin-top:8px; display:none;"></div>
@@ -518,14 +508,13 @@ function loadState(){
     const raw = localStorage.getItem(STORAGE_KEY);
     if(raw){
       const parsed = JSON.parse(raw);
-      if(!Array.isArray(parsed.deletedKeys)) parsed.deletedKeys = [];
       if(Array.isArray(parsed.history)){
         parsed.history = dedupeHistory(parsed.history);
       }
       return parsed;
     }
   }catch(e){}
-  return { goalHours: 16, active: null, history: [], deletedKeys: [], updatedAt: 0 };
+  return { goalHours: 16, active: null, history: [] };
 }
 // Collapse exact duplicate entries (same start AND end timestamp) down to
 // one — guards against a double-tapped Save/Import ever leaving two
@@ -542,193 +531,29 @@ function dedupeHistory(history){
   return out;
 }
 function saveState(){
-  state.updatedAt = Date.now();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  scheduleCloudSync();
 }
 
 let state = loadState();
 
-// ================= Google Drive sync =================
-const GOOGLE_CLIENT_ID = '972329411344-t4n4fhq1eivgbvmhqem7nmitdjt16t5n.apps.googleusercontent.com';
-const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
-const DRIVE_FILE_NAME = 'fasting-tracker-data.json';
-let accessToken = null;
-let driveFileId = null;
-let tokenClient = null;
-let cloudSyncTimer = null;
-let syncing = false;
-
-function setSyncStatus(mode, label){
-  const btn = document.getElementById('sync-btn');
-  btn.className = mode;
-  document.getElementById('sync-label').textContent = label;
-}
-
-function loadTokenFromSession(){
-  const t = sessionStorage.getItem('gdrive_token');
-  const exp = sessionStorage.getItem('gdrive_token_exp');
-  if(t && exp && Date.now() < parseInt(exp,10)){
-    accessToken = t;
-    return true;
-  }
-  return false;
-}
-
-function initGoogle(){
-  if(typeof google === 'undefined' || !google.accounts){
-    // library not loaded yet, retry shortly
-    setTimeout(initGoogle, 400);
-    return;
-  }
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: GOOGLE_CLIENT_ID,
-    scope: DRIVE_SCOPE,
-    callback: (resp) => {
-      if(resp.error){
-        setSyncStatus('error', 'Sign-in failed');
-        return;
-      }
-      accessToken = resp.access_token;
-      sessionStorage.setItem('gdrive_token', accessToken);
-      sessionStorage.setItem('gdrive_token_exp', String(Date.now() + (resp.expires_in-60)*1000));
-      pullThenPush();
-    }
-  });
-
-  if(loadTokenFromSession()){
-    pullThenPush();
-  }
-}
-
-document.getElementById('sync-btn').addEventListener('click', ()=>{
-  if(!tokenClient) return;
-  tokenClient.requestAccessToken({ prompt: accessToken ? '' : 'consent' });
+// ---------- backup: export / import a JSON file ----------
+// Manual export replaces live Drive sync — one tap downloads your full
+// history as a small JSON file, which iOS offers to save straight into
+// Files (and from there, iCloud Drive if that's set up), giving real
+// backup protection without any background sync code that can misfire.
+document.getElementById('header-btn').addEventListener('click', ()=>{
+  const payload = JSON.stringify(state, null, 2);
+  const blob = new Blob([payload], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0,10);
+  a.href = url;
+  a.download = `fasting-backup-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(()=> URL.revokeObjectURL(url), 5000);
 });
-
-async function driveFind(){
-  const res = await fetch(
-    `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name%3D%27${DRIVE_FILE_NAME}%27&fields=files(id,modifiedTime)`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
-  if(res.status === 401) throw { authExpired: true };
-  const data = await res.json();
-  return (data.files && data.files[0]) || null;
-}
-
-async function driveDownload(fileId){
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-  if(res.status === 401) throw { authExpired: true };
-  return res.json();
-}
-
-async function driveCreate(content){
-  const boundary = 'ftboundary';
-  const metadata = { name: DRIVE_FILE_NAME, parents: ['appDataFolder'] };
-  const body =
-    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
-    `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(content)}\r\n--${boundary}--`;
-  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
-    body
-  });
-  if(res.status === 401) throw { authExpired: true };
-  const data = await res.json();
-  return data.id;
-}
-
-async function driveUpdate(fileId, content){
-  const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
-    method: 'PATCH',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(content)
-  });
-  if(res.status === 401) throw { authExpired: true };
-}
-
-function fastKey(f){ return `${f.start}|${f.end}`; }
-
-// A safe merge that can only ever ADD data, never silently drop it just
-// because one side's timestamp looks "newer" (a freshly reset device can
-// have a newer timestamp than a device with weeks of real history — that
-// was the exact bug that wiped history before). The only way an entry
-// disappears is if it's explicitly listed in deletedKeys by either side.
-function mergeState(local, remote){
-  const deletedKeys = new Set([...(local.deletedKeys||[]), ...(remote.deletedKeys||[])]);
-
-  const map = new Map();
-  (remote.history||[]).forEach(f => map.set(fastKey(f), f));
-  (local.history||[]).forEach(f => map.set(fastKey(f), f)); // local's version wins on exact collision
-  const mergedHistory = [...map.values()]
-    .filter(f => !deletedKeys.has(fastKey(f)))
-    .sort((a,b) => new Date(b.end) - new Date(a.end));
-
-  // Prefer whichever side has an in-progress fast; if both do, keep local
-  // (it's the one currently on screen).
-  const mergedActive = local.active || remote.active || null;
-  const mergedGoal = typeof local.goalHours === 'number' ? local.goalHours
-                    : (typeof remote.goalHours === 'number' ? remote.goalHours : 16);
-
-  return {
-    history: mergedHistory,
-    active: mergedActive,
-    goalHours: mergedGoal,
-    deletedKeys: [...deletedKeys],
-    updatedAt: Date.now()
-  };
-}
-
-async function pullThenPush(){
-  if(!accessToken || syncing) return;
-  syncing = true;
-  setSyncStatus('syncing', 'Syncing…');
-  try{
-    const file = await driveFind();
-    if(file){
-      driveFileId = file.id;
-      const remote = await driveDownload(file.id);
-      const merged = mergeState(state, remote || {});
-      state.history = merged.history;
-      state.active = merged.active;
-      state.goalHours = merged.goalHours;
-      state.deletedKeys = merged.deletedKeys;
-      state.updatedAt = merged.updatedAt;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      renderTimer(); renderStats(); renderHistory();
-      await driveUpdate(file.id, { ...state });
-    } else {
-      state.updatedAt = state.updatedAt || Date.now();
-      driveFileId = await driveCreate({ ...state });
-    }
-    setSyncStatus('synced', 'Synced');
-  }catch(e){
-    if(e && e.authExpired){
-      accessToken = null;
-      sessionStorage.removeItem('gdrive_token');
-      setSyncStatus('error', 'Reconnect Drive');
-    } else {
-      setSyncStatus('error', 'Sync failed');
-    }
-  }
-  syncing = false;
-}
-
-function scheduleCloudSync(){
-  if(!accessToken) return;
-  clearTimeout(cloudSyncTimer);
-  cloudSyncTimer = setTimeout(async ()=>{
-    // Always merge-with-remote before pushing, even on a routine save, so a
-    // quick local edit can never clobber history that arrived on the other
-    // device moments ago.
-    pullThenPush();
-  }, 1500);
-}
-
-window.addEventListener('load', initGoogle);
-// =============== end Google Drive sync ===============
 
 // ---------- helpers ----------
 function pad(n){ return n.toString().padStart(2,'0'); }
@@ -849,6 +674,38 @@ document.getElementById('btn-import').addEventListener('click', ()=>{
 document.getElementById('import-cancel').addEventListener('click', ()=>{
   importModal.classList.remove('show');
 });
+document.getElementById('import-file-btn').addEventListener('click', ()=>{
+  document.getElementById('import-file').click();
+});
+document.getElementById('import-file').addEventListener('change', (e)=>{
+  const file = e.target.files[0];
+  if(!file) return;
+  const errEl = document.getElementById('import-error');
+  errEl.style.display = 'none';
+  const reader = new FileReader();
+  reader.onload = () => {
+    try{
+      const parsed = JSON.parse(reader.result);
+      // A full exported backup is {goalHours, active, history:[...]} —
+      // pull just the history array out for the importer below. A plain
+      // array (an older-style batch) is used as-is.
+      const arr = Array.isArray(parsed) ? parsed
+                : (parsed && Array.isArray(parsed.history)) ? parsed.history
+                : null;
+      if(!arr){
+        errEl.textContent = "That file doesn't look like a fasting backup.";
+        errEl.style.display = 'block';
+        return;
+      }
+      document.getElementById('import-text').value = JSON.stringify(arr, null, 2);
+    }catch(err){
+      errEl.textContent = "Couldn't read that file — is it a valid JSON backup?";
+      errEl.style.display = 'block';
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = ''; // allow picking the same file again later
+});
 document.getElementById('import-save').addEventListener('click', ()=>{
   const errEl = document.getElementById('import-error');
   errEl.style.display = 'none';
@@ -865,6 +722,26 @@ document.getElementById('import-save').addEventListener('click', ()=>{
   let added = 0;
   let skippedDupes = 0;
   entries.forEach(item=>{
+    // Raw shape: already-exact UTC timestamps, exactly as this app stores
+    // them internally. This is what a previously-exported backup file
+    // round-trips through — no reinterpretation needed at all.
+    if(item.start && item.end && !item.startLocal){
+      const start = new Date(item.start);
+      const end = new Date(item.end);
+      if(isNaN(start) || isNaN(end) || end <= start) return;
+      const key = `${start.toISOString()}|${end.toISOString()}`;
+      if(existingKeys.has(key)){ skippedDupes++; return; }
+      existingKeys.add(key);
+      const goalHours = typeof item.goalHours === 'number' ? item.goalHours : state.goalHours;
+      state.history.push({
+        start: start.toISOString(),
+        end: end.toISOString(),
+        goalHours,
+        durMs: end - start
+      });
+      added++;
+      return;
+    }
     // Precise shape: exact local start/end datetimes (no timezone suffix,
     // so the phone's own JS parses them in its own local time — this
     // preserves exact logged times instead of collapsing to a generic
@@ -1042,11 +919,6 @@ function renderHistory(){
   el.querySelectorAll('.del-x').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const idx = parseInt(btn.dataset.idx,10);
-      const removed = state.history[idx];
-      if(removed){
-        if(!Array.isArray(state.deletedKeys)) state.deletedKeys = [];
-        state.deletedKeys.push(fastKey(removed));
-      }
       state.history.splice(idx,1);
       saveState();
       renderHistory();
@@ -1124,13 +996,12 @@ setInterval(renderTimer, 1000);
 // comes back to the foreground, force an immediate correct re-render
 // (renderTimer recomputes elapsed from Date.now() fresh each call, so this
 // always self-corrects instantly) instead of waiting on a possibly-stalled
-// tick, and opportunistically re-sync with Drive too.
+// tick.
 document.addEventListener('visibilitychange', ()=>{
   if(!document.hidden){
     renderTimer();
     renderStats();
     renderHistory();
-    if(accessToken) pullThenPush();
   }
 });
 
